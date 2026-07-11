@@ -29,8 +29,8 @@ info() { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $1"; }
 
 # 配置
 MANIFEST_URL="https://github.com/OnePlusOSS/kernel_manifest.git"
-MANIFEST_BRANCH="oneplus/sm8750"
-MANIFEST_NAME="oneplus_ace_6.xml"
+MANIFEST_BRANCH="oneplus/sm8845"
+MANIFEST_NAME="oneplus_ace_6t.xml"
 KERNEL_REPO_PATH="kernel_platform/common"
 WORKSPACE="$PWD/kernel_workspace"
 OUTPUT_DIR="$PWD/output"
@@ -269,7 +269,7 @@ Source:
   Manifest: $MANIFEST_URL
   Branch:   $MANIFEST_BRANCH
   XML:      $MANIFEST_NAME
-  Revision: oneplus/sm8750_b_16.0.0_ace_6
+  Revision: oneplus/sm8845_b_16.0.0_ace_6t
 
 Device Target:
   SoC: Qualcomm SM8750 (Snapdragon 8 Elite Gen 5)
