@@ -154,26 +154,43 @@ jobs:
       # 使用自定义 Python 脚本, 绕过 manifest 中失效的 CodeLinaro 项目
       ########################################################################
       - name: Sync kernel source
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p kernel_workspace
-          cd kernel_workspace
+shell: bash
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+run: |
+  mkdir -p kernel_workspace
+  cd kernel_workspace
 
-          python3 ${{ github.workspace }}/scripts/sync_source.py \
-            --manifest-url "https://raw.githubusercontent.com/OnePlusOSS/kernel_manifest/oneplus/sm8845/oneplus_ace_6t.xml" \
-            --output-dir . \
-            --debug ${{ inputs.debug_mode }}
+  # 1. 修正清单仓库地址 (请确认这是正确的仓库地址)
+  MANIFEST_REPO="https://github.com/OnePlusOSS/kernel_manifest.git"
+  # 2. 修正分支名 (根据你之前的URL推断是 'oneplus')
+  MANIFEST_BRANCH="oneplus"
+  # 3. 修正清单文件名
+  MANIFEST_FILE="sm8845/oneplus_ace_6t.xml"
 
-          echo ""
-          echo "=== 同步后磁盘使用 ==="
-          df -h /
-          echo ""
-          echo "=== 源码目录结构 ==="
-          ls -la
-          echo ""
-          ls -la kernel_platform/ 2>/dev/null || echo "kernel_platform 不存在!"
+  # 4. 正确处理布尔值参数
+  DEBUG_FLAG=""
+  if [ "${{ inputs.debug_mode }}" == "true" ]; then
+    DEBUG_FLAG="--debug"
+  fi
+
+  # 5. 执行同步命令
+  python3 ${{ github.workspace }}/scripts/sync_source.py \
+    --manifest-url "$MANIFEST_REPO" \
+    --manifest-branch "$MANIFEST_BRANCH" \
+    --manifest-name "$MANIFEST_FILE" \
+    --output-dir . \
+    $DEBUG_FLAG
+
+  echo ""
+  echo "=== 同步后磁盘使用 ==="
+  df -h /
+  echo ""
+  echo "=== 源码目录结构 ==="
+  ls -la
+  echo ""
+  ls -la kernel_platform/ 2>/dev/null || echo "kernel_platform 不存在!"
+
 
       ########################################################################
       # Step 5: 编译内核
