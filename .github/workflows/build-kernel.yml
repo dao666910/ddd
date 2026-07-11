@@ -1,518 +1,325 @@
-#!/bin/bash
 ###############################################################################
-# OnePlus Ace 6T (SM8845) 内核编译脚本
-# 官方开源仓库: OnePlusOSS/android_kernel_oneplus_sm8845
-# 内核版本: 6.12.38-android16-5 (Android 16 / kernel 6.12)
+# OnePlus Ace 6T (SM8845) 内核编译 - GitHub Actions Workflow
 #
-# 本脚本解决的关键问题:
-#   官方 manifest (oneplus_ace_6t.xml) 引用了 CodeLinaro 上已被删除的分支
-#   ks-kernel.lnx.5.0.r3-rel, 导致 repo sync 失败的两个项目:
-#     - kernel_platform/prebuilts/asuite       (ASan 工具, 编译内核不需要)
-#     - kernel_platform/prebuilts/tradefed     (TradeFederation 测试框架, 编译内核不需要)
-#   解决方案: 通过 local_manifest 在同步前移除这两个项目
+# 使用方法:
+#   1. 在 GitHub 创建一个新仓库 (public 或 private 均可)
+#   2. 将本目录所有内容上传到仓库根目录:
+#        .github/workflows/build-kernel.yml  (本文件)
+#        scripts/sync_source.py              (源码同步脚本)
+#        scripts/build_kernel.sh             (编译脚本)
+#        scripts/extract_artifacts.sh        (产物提取脚本)
+#   3. 进入仓库 Actions 标签页
+#   4. 选择 "Build OnePlus Ace 6T Kernel" workflow
+#   5. 点击 "Run workflow", 选择参数后运行
 #
-# 硬件/软件要求:
-#   - x86_64 Linux (Ubuntu 22.04+ 推荐)
-#   - 至少 16GB RAM (推荐 32GB)
-#   - 至少 80GB 可用磁盘
-#   - Python 3.10+, git, repo, curl, build-essential
+# 产物:
+#   - vmlinux              (未压缩内核镜像, 含完整符号表)
+#   - Image                (压缩后可刷入的内核镜像)
+#   - kallsyms.txt         (从 vmlinux 提取的符号表)
+#   - kernel_headers.tar.gz(内核头文件)
+#   - build_info.txt       (构建信息)
 #
-# 用法:
-#   chmod +x build_oneplus_ace6t_kernel.sh
-#   ./build_oneplus_ace6t_kernel.sh           # 完整流程: 同步+编译+提取
-#   ./build_oneplus_ace6t_kernel.sh sync      # 仅同步源码
-#   ./build_oneplus_ace6t_kernel.sh build     # 仅编译(需先同步)
-#   ./build_oneplus_ace6t_kernel.sh extract   # 仅提取 vmlinux/kallsyms(需先编译)
+# 预计耗时: 60-120 分钟 (取决于 GitHub runner 负载)
+# 磁占用峰值: ~60 GB (GitHub runner 14GB 可用, 已做磁盘清理)
 ###############################################################################
 
-set -euo pipefail
-
-# ============================== 配置区 ==============================
-MANIFEST_REPO="https://github.com/OnePlusOSS/kernel_manifest.git"
-MANIFEST_BRANCH="oneplus/sm8845"
-MANIFEST_NAME="oneplus_ace_6t.xml"
-
-# 三个 OnePlus OSS 仓库
-REPO_KERNEL="https://github.com/OnePlusOSS/android_kernel_oneplus_sm8845.git"
-REPO_MODULES="https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8845.git"
-REPO_COMMON="https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8845.git"
-BRANCH="oneplus/sm8845_b_16.0.0_ace_6t"
-
-# 构建参数
-# sun = 高通对 SM8845 的代号
-# perf = 正式版(user), consolidate = 调试版(userdebug)
-BUILD_PLATFORM="sun"
-BUILD_VARIANT="perf"   # 改为 consolidate 可编译调试版
-
-# 工作目录
-WORKSPACE_DIR="${WORKSPACE_DIR:-$HOME/kernel_workspace_ace6t}"
-JOBS="${JOBS:-$(nproc)}"
-
-# ============================== 颜色输出 ==============================
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-log()  { echo -e "${GREEN}[$(date '+%H:%M:%S')]${NC} $*"; }
-warn() { echo -e "${YELLOW}[$(date '+%H:%M:%S')] WARN:${NC} $*"; }
-err()  { echo -e "${RED}[$(date '+%H:%M:%S')] ERROR:${NC} $*" >&2; }
-info() { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $*"; }
-
-# ============================== 环境检查 ==============================
-check_environment() {
-    log "检查编译环境..."
-
-    # 检查架构
-    if [ "$(uname -m)" != "x86_64" ]; then
-        warn "建议在 x86_64 Linux 上编译, 当前架构: $(uname -m)"
-    fi
-
-    # 检查内存
-    local mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-    local mem_gb=$((mem_kb / 1024 / 1024))
-    if [ "$mem_gb" -lt 12 ]; then
-        err "内存不足: ${mem_gb}GB, 至少需要 16GB (推荐 32GB)"
-        err "可通过 swap 临时增加, 但编译会非常慢"
-        exit 1
-    fi
-    info "内存: ${mem_gb}GB"
-
-    # 检查磁盘
-    local avail_kb=$(df -P "${WORKSPACE_DIR%/*}" 2>/dev/null | awk 'NR==2{print $4}' || df -P "$HOME" | awk 'NR==2{print $4}')
-    local avail_gb=$((avail_kb / 1024 / 1024))
-    if [ "$avail_gb" -lt 60 ]; then
-        err "磁盘空间不足: ${avail_gb}GB 可用, 至少需要 80GB"
-        exit 1
-    fi
-    info "磁盘可用: ${avail_gb}GB"
-
-    # 检查必要工具
-    for tool in git python3 curl; do
-        if ! command -v $tool >/dev/null 2>&1; then
-            err "缺少工具: $tool"
-            err "Ubuntu/Debian: sudo apt install -y $tool"
-            exit 1
-        fi
-    done
-
-    # 检查 repo 工具
-    if ! command -v repo >/dev/null 2>&1; then
-        warn "未找到 repo 工具, 正在安装..."
-        mkdir -p "$HOME/bin"
-        curl -sL https://storage.googleapis.com/git-repo-downloads/repo > "$HOME/bin/repo"
-        chmod a+x "$HOME/bin/repo"
-        export PATH="$HOME/bin:$PATH"
-        info "repo 已安装到 $HOME/bin/repo"
-    fi
-
-    # 安装编译依赖
-    log "检查编译依赖包..."
-    if command -v apt >/dev/null 2>&1; then
-        sudo apt update -qq
-        sudo apt install -y -qq \
-            build-essential \
-            bc \
-            bison \
-            flex \
-            libssl-dev \
-            libelf-dev \
-            libncurses-dev \
-            lz4 \
-            cpio \
-            zip \
-            unzip \
-            python3-pip \
-            openjdk-21-jdk \
-            2>/dev/null || warn "部分依赖安装失败, 请手动检查"
-    fi
-
-    log "环境检查通过"
-}
-
-# ============================== 同步源码 ==============================
-sync_source() {
-    log "开始同步 OnePlus Ace 6T (SM8845) 内核源码"
-    mkdir -p "$WORKSPACE_DIR"
-    cd "$WORKSPACE_DIR"
-
-    # 初始化 repo
-    if [ ! -d ".repo" ]; then
-        log "初始化 repo (manifest: $MANIFEST_BRANCH / $MANIFEST_NAME)"
-        repo init -u "$MANIFEST_REPO" -b "$MANIFEST_BRANCH" -m "$MANIFEST_NAME"
-    fi
-
-    # ============================================================
-    # 关键修复: 创建 local_manifest 移除同步失败的项目
-    # ============================================================
-    log "创建 local_manifest 移除 CodeLinaro 上已失效的项目..."
-    mkdir -p ".repo/local_manifests"
-    cat > ".repo/local_manifests/remove_failing_projects.xml" << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<manifest>
-  <!--
-    这两个项目引用了 CodeLinaro 上已被删除的分支 ks-kernel.lnx.5.0.r3-rel
-    - prebuilts/asuite : ASan (AddressSanitizer) 工具, 仅用于内存检测, 编译内核不需要
-    - prebuilts/tradefed : TradeFederation 测试框架, 仅用于自动化测试, 编译内核不需要
-    移除它们不影响 vmlinux/Image 的生成
-  -->
-  <remove-project name="kernel_platform/prebuilts/asuite" />
-  <remove-project name="kernel_platform/tools/tradefederation/prebuilts" />
-</manifest>
-EOF
-    info "local_manifest 已写入: .repo/local_manifests/remove_failing_projects.xml"
-
-    # 同步 (使用 -j1 --fail-fast 便于定位问题, 可调高 -j 加速)
-    log "开始 repo sync (jobs=$JOBS)..."
-    log "首次同步约需 30-90 分钟, 取决于网络"
-
-    # 第一次尝试: 完整同步
-    if ! repo sync -c -j"$JOBS" --no-tags --no-clone-bundle --force-sync 2>&1 | tee sync.log; then
-        warn "完整同步遇到错误, 尝试逐项目同步..."
-        # 逐项目同步, 跳过失败的项目
-        repo sync -c -j1 --no-tags --no-clone-bundle -f 2>&1 | tee -a sync.log || true
-    fi
-
-    # 验证关键仓库是否同步成功
-    local missing=0
-    for path in \
-        "kernel_platform/common" \
-        "kernel_platform/soc-repo" \
-        "kernel_platform/build" \
-        "kernel_platform/build/kernel/kleaf" \
-        "kernel_platform/prebuilts/kernel-build-tools" \
-        "kernel_platform/prebuilts/clang/host/linux-x86" \
-        "vendor/qcom"; do
-        if [ ! -d "$path" ]; then
-            err "关键目录缺失: $path"
-            missing=1
-        fi
-    done
-
-    if [ "$missing" -eq 1 ]; then
-        err "源码同步不完整, 请检查 sync.log"
-        err "可手动重试: cd $WORKSPACE_DIR && repo sync -c -j1 -f"
-        exit 1
-    fi
-
-    log "源码同步完成!"
-    info "工作目录: $WORKSPACE_DIR"
-    info "内核源码在: $WORKSPACE_DIR/kernel_platform/common"
-    info "SoC/设备源码在: $WORKSPACE_DIR/kernel_platform/soc-repo"
-    info "模块/设备树在: $WORKSPACE_DIR/vendor"
-}
-
-# ============================== 编译内核 ==============================
-build_kernel() {
-    cd "$WORKSPACE_DIR"
-    log "开始编译 OnePlus Ace 6T 内核"
-    info "平台: $BUILD_PLATFORM (SM8845)"
-    info "变体: $BUILD_VARIANT ($([ "$BUILD_VARIANT" = "perf" ] && echo "user/正式版" || echo "userdebug/调试版"))"
-    info "并发数: $JOBS"
-
-    # 确认源码存在
-    if [ ! -f "kernel_platform/oplus/build/oplus_build_kernel.sh" ]; then
-        err "未找到构建脚本, 请先运行: $0 sync"
-        exit 1
-    fi
-
-    # ============================================================
-    # 方式 A: 使用 OnePlus 官方构建脚本 (推荐, 生成完整 boot.img)
-    # ============================================================
-    log "使用 OnePlus 官方构建脚本..."
-    chmod +x kernel_platform/oplus/build/*.sh
-
-    # 官方脚本内部会调用 bazel, 这里设置并发数
-    export JOBS
-    export LTO=thin   # consolidate 变体需要
-
-    # 执行构建
-    # 命令格式: oplus_build_kernel.sh <platform> <variant>
-    # platform = sun (SM8845 代号)
-    # variant  = perf (user) 或 consolidate (userdebug)
-    if ./kernel_platform/oplus/build/oplus_build_kernel.sh "$BUILD_PLATFORM" "$BUILD_VARIANT" 2>&1 | tee build.log; then
-        log "内核编译成功!"
-    else
-        err "官方脚本构建失败, 尝试直接 bazel 构建..."
-        build_with_bazel_fallback
-    fi
-
-    # ============================================================
-    # 方式 B (备用): 直接用 bazel 编译 vmlinux (不打包 boot.img)
-    # ============================================================
-    build_with_bazel_fallback() {
-        warn "使用 bazel 直接构建 vmlinux (不打包完整镜像)..."
-        cd "$WORKSPACE_DIR/kernel_platform"
-
-        # 确保 bazel 工具就位
-        if [ ! -x "tools/bazel" ]; then
-            err "未找到 bazel 工具: kernel_platform/tools/bazel"
-            exit 1
-        fi
-
-        # 直接构建 vmlinux 目标
-        # sun_perf 对应 SM8845 user 版本
-        local bazel_target="//msm-kernel:sun_${BUILD_VARIANT}"
-        log "bazel 目标: $bazel_target"
-
-        ./tools/bazel build \
-            --config=local \
-            --config=fast \
-            --jobs="$JOBS" \
-            "$bazel_target" 2>&1 | tee -a ../build.log
-
-        if [ ${PIPESTATUS[0]} -eq 0 ]; then
-            log "bazel 构建成功!"
-        else
-            err "bazel 构建也失败, 请检查 build.log"
-            exit 1
-        fi
-    }
-
-    # 显示构建产物
-    log "查找构建产物..."
-    find "$WORKSPACE_DIR/kernel_platform/out" \
-         "$WORKSPACE_DIR/kernel_platform/bazel-bin" \
-         -name "vmlinux" -o -name "Image" -o -name "Image.gz" 2>/dev/null | head -20
-
-    log "构建产物位置:"
-    info "vmlinux: $WORKSPACE_DIR/kernel_platform/out/msm-kernel-${BUILD_PLATFORM}-${BUILD_VARIANT}/dist/vmlinux"
-    info "Image:   $WORKSPACE_DIR/kernel_platform/out/msm-kernel-${BUILD_PLATFORM}-${BUILD_VARIANT}/dist/Image"
-    info "boot.img: $WORKSPACE_DIR/kernel_platform/out/msm-kernel-${BUILD_PLATFORM}-${BUILD_VARIANT}/dist/boot.img"
-}
-
-# ============================== 提取 vmlinux/kallsyms ==============================
-extract_artifacts() {
-    cd "$WORKSPACE_DIR"
-    log "提取 vmlinux 和 kallsyms"
-
-    local dist_dir="kernel_platform/out/msm-kernel-${BUILD_PLATFORM}-${BUILD_VARIANT}/dist"
-    local bazel_dir="kernel_platform/bazel-bin/msm-kernel/${BUILD_PLATFORM}_${BUILD_VARIANT}"
-
-    # 查找 vmlinux
-    local vmlinux=""
-    for candidate in \
-        "$dist_dir/vmlinux" \
-        "$bazel_dir/vmlinux" \
-        "$(find kernel_platform -name vmlinux -type f 2>/dev/null | head -1)"; do
-        if [ -n "$candidate" ] && [ -f "$candidate" ]; then
-            vmlinux="$candidate"
-            break
-        fi
-    done
-
-    if [ -z "$vmlinux" ]; then
-        err "未找到 vmlinux, 请确认编译成功"
-        err "可手动查找: find $WORKSPACE_DIR -name vmlinux -type f"
-        exit 1
-    fi
-
-    log "找到 vmlinux: $vmlinux"
-    local vmlinux_size=$(du -h "$vmlinux" | awk '{print $1}')
-    info "vmlinux 大小: $vmlinux_size"
-
-    # 创建输出目录
-    local out_dir="$WORKSPACE_DIR/artifacts"
-    mkdir -p "$out_dir"
-
-    # 复制 vmlinux
-    cp -v "$vmlinux" "$out_dir/vmlinux"
-    info "vmlinux 已复制到: $out_dir/vmlinux"
-
-    # 复制 Image (压缩前的内核镜像)
-    if [ -f "$dist_dir/Image" ]; then
-        cp -v "$dist_dir/Image" "$out_dir/Image"
-        info "Image 已复制到: $out_dir/Image"
-    fi
-
-    # 复制 System.map (符号表)
-    if [ -f "$dist_dir/System.map" ]; then
-        cp -v "$dist_dir/System.map" "$out_dir/System.map"
-        info "System.map 已复制到: $out_dir/System.map"
-    fi
-
-    # ============================================================
-    # 从 vmlinux 提取 kallsyms
-    # ============================================================
-    log "从 vmlinux 提取 kallsyms 符号表..."
-
-    # 方法 1: 使用 nm (需要 aarch64 工具链)
-    if command -v aarch64-linux-gnu-nm >/dev/null 2>&1; then
-        log "使用 aarch64-linux-gnu-nm 提取符号..."
-        aarch64-linux-gnu-nm "$vmlinux" > "$out_dir/kallsyms_nm.txt" 2>/dev/null || true
-    fi
-
-    # 方法 2: 使用 llvm-nm (bazel 自带)
-    local llvm_nm=""
-    for candidate in \
-        "kernel_platform/prebuilts/clang/host/linux-x86/llvm-binutils-stable/llvm-nm" \
-        "$(find kernel_platform -name llvm-nm -type f 2>/dev/null | head -1)"; do
-        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-            llvm_nm="$candidate"
-            break
-        fi
-    done
-
-    if [ -n "$llvm_nm" ]; then
-        log "使用 llvm-nm 提取符号: $llvm_nm"
-        "$llvm_nm" "$vmlinux" > "$out_dir/kallsyms_nm.txt" 2>/dev/null || true
-        info "nm 符号表: $out_dir/kallsyms_nm.txt ($(wc -l < "$out_dir/kallsyms_nm.txt") 行)"
-    fi
-
-    # 方法 3: 从 vmlinux 的 .rodata 段提取嵌入的 kallsyms (与 /proc/kallsyms 等价)
-    log "从 vmlinux 内嵌数据提取 kallsyms (与设备 /proc/kallsyms 等价)..."
-    extract_embedded_kallsyms "$vmlinux" "$out_dir/kallsyms_embedded.txt"
-
-    # 方法 4: 使用 objdump 反汇编符号表
-    local llvm_objdump=""
-    for candidate in \
-        "kernel_platform/prebuilts/clang/host/linux-x86/llvm-binutils-stable/llvm-objdump" \
-        "$(find kernel_platform -name llvm-objdump -type f 2>/dev/null | head -1)"; do
-        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-            llvm_objdump="$candidate"
-            break
-        fi
-    done
-
-    if [ -n "$llvm_objdump" ]; then
-        log "使用 llvm-objdump 生成符号表..."
-        "$llvm_objdump" -t "$vmlinux" > "$out_dir/symbols_objdump.txt" 2>/dev/null || true
-        info "objdump 符号表: $out_dir/symbols_objdump.txt"
-    fi
-
-    # 生成摘要
-    log "生成构建摘要..."
-    cat > "$out_dir/BUILD_INFO.txt" << EOF
-============================================
-OnePlus Ace 6T (SM8845) 内核构建信息
-============================================
-构建时间:    $(date '+%Y-%m-%d %H:%M:%S')
-内核版本:    6.12.38-android16-5
-平台:        $BUILD_PLATFORM (SM8845 / 骁龙8 Gen5)
-变体:        $BUILD_VARIANT ($([ "$BUILD_VARIANT" = "perf" ] && echo "user/正式版" || echo "userdebug/调试版"))
-源码分支:    $BRANCH
-工作目录:    $WORKSPACE_DIR
-vmlinux 大小: $vmlinux_size
-
-文件清单:
-  vmlinux              - 未压缩的 ELF 内核镜像 (含完整调试符号)
-  Image                - 压缩前的 ARM64 内核镜像 (用于 boot.img)
-  System.map           - 内核符号表 (地址 + 符号名)
-  kallsyms_nm.txt      - nm 提取的符号表
-  kallsyms_embedded.txt - vmlinux 内嵌的 kallsyms (与 /proc/kallsyms 等价)
-  symbols_objdump.txt  - objdump 提取的完整符号表
-
-源码仓库:
-  - https://github.com/OnePlusOSS/android_kernel_oneplus_sm8845 (分支: $BRANCH)
-  - https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8845
-  - https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8845
-  - https://github.com/OnePlusOSS/kernel_manifest (分支: oneplus/sm8845, manifest: oneplus_ace_6t.xml)
-EOF
-
-    info "构建摘要: $out_dir/BUILD_INFO.txt"
-
-    # 打包
-    log "打包产物..."
-    local tar_name="oneplus_ace6t_kernel_$(date '+%Y%m%d_%H%M%S').tar.gz"
-    tar -czf "$WORKSPACE_DIR/$tar_name" \
-        -C "$out_dir" \
-        vmlinux Image System.map \
-        kallsyms_nm.txt kallsyms_embedded.txt symbols_objdump.txt \
-        BUILD_INFO.txt 2>/dev/null || \
-    tar -czf "$WORKSPACE_DIR/$tar_name" -C "$out_dir" . 2>/dev/null
-
-    log "打包完成: $WORKSPACE_DIR/$tar_name"
-    log "所有产物在: $out_dir"
-    ls -lah "$out_dir"
-}
-
-# 从 vmlinux 提取内嵌 kallsyms (模拟 /proc/kallsyms 输出)
-extract_embedded_kallsyms() {
-    local vmlinux="$1"
-    local output="$2"
-
-    # kallsyms 在内核编译时被嵌入到 .rodata 段
-    # 使用 nm 提取所有符号并格式化为 /proc/kallsyms 格式: "地址 类型 符号名"
-    local nm_tool=""
-    for candidate in \
-        "kernel_platform/prebuilts/clang/host/linux-x86/llvm-binutils-stable/llvm-nm" \
-        "$(command -v aarch64-linux-gnu-nm 2>/dev/null)" \
-        "$(command -v nm 2>/dev/null)"; do
-        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-            nm_tool="$candidate"
-            break
-        fi
-    done
-
-    if [ -z "$nm_tool" ]; then
-        warn "未找到 nm 工具, 跳过 kallsyms 提取"
-        return
-    fi
-
-    # nm 输出格式: "地址 类型 符号名"
-    # /proc/kallsyms 格式: "地址 类型 符号名 [模块]"
-    # 直接使用 nm 输出即可, 类型字符含义:
-    #   T/t = 代码段 (text)
-    #   D/d = 已初始化数据 (data)
-    #   B/b = 未初始化数据 (bss)
-    #   R/r = 只读数据 (rodata)
-    #   W/w = 弱符号
-    #   A   = 绝对符号
-    # 大写 = 全局, 小写 = 局部
-
-    "$nm_tool" -n "$vmlinux" 2>/dev/null | \
-        awk 'NF>=3 && $1 ~ /^[0-9a-f]+$/ {print $1, $2, $3}' > "$output"
-
-    local count=$(wc -l < "$output")
-    info "kallsyms 符号数: $count"
-    info "kallsyms 文件: $output"
-
-    # 显示前 20 个符号作为示例
-    if [ "$count" -gt 0 ]; then
-        log "前 20 个符号示例:"
-        head -20 "$output"
-    fi
-}
-
-# ============================== 主流程 ==============================
-main() {
-    local action="${1:-all}"
-
-    echo -e "${BLUE}========================================${NC}"
-    echo -e "${BLUE}OnePlus Ace 6T (SM8845) 内核编译脚本${NC}"
-    echo -e "${BLUE}内核: 6.12.38-android16-5${NC}"
-    echo -e "${BLUE}========================================${NC}"
-    echo ""
-    info "工作目录: $WORKSPACE_DIR"
-    info "操作: $action"
-    echo ""
-
-    case "$action" in
-        sync)
-            check_environment
-            sync_source
-            ;;
-        build)
-            check_environment
-            build_kernel
-            ;;
-        extract)
-            extract_artifacts
-            ;;
-        all|"")
-            check_environment
-            sync_source
-            build_kernel
-            extract_artifacts
-            log "全部完成! 产物在: $WORKSPACE_DIR/artifacts"
-            ;;
-        *)
-            err "未知操作: $action"
-            echo "用法: $0 [sync|build|extract|all]"
-            exit 1
-            ;;
-    esac
-}
-
-main "$@"
+name: Build OnePlus Ace 6T Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_variant:
+        description: '构建变体 (consolidate=调试版含完整符号, perf=正式版)'
+        required: true
+        type: choice
+        options:
+          - consolidate
+          - perf
+        default: consolidate
+      extract_vmlinux:
+        description: '提取 vmlinux (未压缩内核, ~500MB, 含完整符号表)'
+        required: true
+        type: boolean
+        default: true
+      extract_kallsyms:
+        description: '从 vmlinux 提取 kallsyms 符号表'
+        required: true
+        type: boolean
+        default: true
+      debug_mode:
+        description: '调试模式 (输出详细日志, 上传完整 build.log)'
+        required: true
+        type: boolean
+        default: false
+
+# 同一时间只允许一个构建运行, 避免磁盘冲突
+concurrency:
+  group: build-ace6t-kernel
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      ########################################################################
+      # Step 1: 磁盘空间清理
+      # GitHub runner 默认只有 ~14GB 可用, 内核编译需要 ~60GB
+      # 通过移除预装软件释放空间
+      ########################################################################
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        shell: bash
+        run: |
+          echo "=== 清理前磁盘使用 ==="
+          df -h /
+          echo ""
+
+          echo "=== 移除预装软件 ==="
+          sudo rm -rf /usr/share/dotnet \
+                       /usr/local/lib/android \
+                       /opt/ghc \
+                       /opt/hostedtoolcache/CodeQL \
+                       /usr/local/share/chromium \
+                       /usr/local/share/powershell \
+                       /usr/local/lib/heroku \
+                       /usr/local/lib/node_modules \
+                       /opt/az \
+                       /opt/microsoft/powershell \
+                       /opt/hostedtoolcache/go \
+                       /opt/hostedtoolcache/PyPy \
+                       /opt/hostedtoolcache/node \
+                       /usr/local/aws-sam-cli \
+                       2>/dev/null || true
+
+          sudo apt-get purge -y firefox google-chrome-stable microsoft-edge-stable \
+                              azure-cli dotnet-sdk-* powershell \
+                              2>/dev/null || true
+          sudo apt-get autoremove -y 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+
+          # 清理 Docker 镜像
+          if command -v docker >/dev/null 2>&1; then
+            docker rmi $(docker images -q) 2>/dev/null || true
+          fi
+
+          echo ""
+          echo "=== 清理后磁盘使用 ==="
+          df -h /
+
+      ########################################################################
+      # Step 2: 安装依赖
+      ########################################################################
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git repo curl wget aria2 pigz python3 python3-pip \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            cpio lz4 zstd xz-utils unzip rsync \
+            llvm clang lld
+
+          # 安装 Python 依赖
+          pip3 install --user requests
+
+          # 检查 repo 工具
+          echo ""
+          echo "=== 工具版本 ==="
+          git --version
+          python3 --version
+          repo --version 2>/dev/null || echo "repo: $(which repo)"
+          aria2c --version 2>/dev/null | head -1 || echo "aria2c not found"
+
+      ########################################################################
+      # Step 3: 配置 Git
+      ########################################################################
+      - name: Configure git
+        shell: bash
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config --global color.ui false
+
+      ########################################################################
+      # Step 4: 同步内核源码
+      # 使用自定义 Python 脚本, 绕过 manifest 中失效的 CodeLinaro 项目
+      ########################################################################
+      - name: Sync kernel source
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+
+          python3 ${{ github.workspace }}/scripts/sync_source.py \
+            --manifest-url "https://raw.githubusercontent.com/OnePlusOSS/kernel_manifest/oneplus/sm8845/oneplus_ace_6t.xml" \
+            --output-dir . \
+            --debug ${{ inputs.debug_mode }}
+
+          echo ""
+          echo "=== 同步后磁盘使用 ==="
+          df -h /
+          echo ""
+          echo "=== 源码目录结构 ==="
+          ls -la
+          echo ""
+          ls -la kernel_platform/ 2>/dev/null || echo "kernel_platform 不存在!"
+
+      ########################################################################
+      # Step 5: 编译内核
+      ########################################################################
+      - name: Build kernel
+        id: build
+        shell: bash
+        run: |
+          cd kernel_workspace
+          bash ${{ github.workspace }}/scripts/build_kernel.sh \
+            --platform sun \
+            --variant ${{ inputs.build_variant }} \
+            --debug ${{ inputs.debug_mode }}
+
+      ########################################################################
+      # Step 6: 提取产物 (vmlinux, kallsyms, Image, headers)
+      ########################################################################
+      - name: Extract artifacts
+        shell: bash
+        run: |
+          cd kernel_workspace
+          bash ${{ github.workspace }}/scripts/extract_artifacts.sh \
+            --output-dir ${{ github.workspace }}/artifacts \
+            --extract-vmlinux ${{ inputs.extract_vmlinux }} \
+            --extract-kallsyms ${{ inputs.extract_kallsyms }} \
+            --debug ${{ inputs.debug_mode }}
+
+      ########################################################################
+      # Step 7: 生成构建信息文件
+      ########################################################################
+      - name: Generate build info
+        shell: bash
+        run: |
+          cd ${{ github.workspace }}/artifacts
+          cat > build_info.txt << EOF
+          ============================================
+          OnePlus Ace 6T (SM8845) Kernel Build Info
+          ============================================
+          Build Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          Build Runner: $(hostname)
+          Build Variant: ${{ inputs.build_variant }}
+          GitHub Run ID: ${{ github.run_id }}
+          GitHub Run Number: ${{ github.run_number }}
+          GitHub Commit: ${{ github.sha }}
+          GitHub Branch: ${{ github.ref_name }}
+
+          Kernel Source:
+            - Manifest: OnePlusOSS/kernel_manifest @ oneplus/sm8845
+            - Kernel: OnePlusOSS/android_kernel_oneplus_sm8845 @ oneplus/sm8845_b_16.0.0_ace_6t
+            - Modules: OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8845
+            - Common: OnePlusOSS/android_kernel_common_oneplus_sm8845
+
+          Target Device:
+            - Device: OnePlus Ace 6T
+            - Chipset: Qualcomm SM8845 (Snapdragon 8 Gen 5)
+            - Android: 16
+            - Kernel: 6.12.38-android16-5
+            - Platform codename: sun
+
+          Build Artifacts:
+          EOF
+
+          ls -lh >> build_info.txt
+          echo "" >> build_info.txt
+          echo "============================================" >> build_info.txt
+
+          cat build_info.txt
+
+      ########################################################################
+      # Step 8: 上传产物
+      ########################################################################
+      - name: Upload vmlinux artifact
+        if: ${{ inputs.extract_vmlinux }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmlinux-ace6t-${{ inputs.build_variant }}
+          path: artifacts/vmlinux
+          retention-days: 30
+          compression-level: 0  # vmlinux 已不可压缩, 0 节省时间
+
+      - name: Upload kallsyms artifact
+        if: ${{ inputs.extract_kallsyms }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: kallsyms-ace6t-${{ inputs.build_variant }}
+          path: artifacts/kallsyms.txt
+          retention-days: 90
+
+      - name: Upload kernel Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-image-ace6t-${{ inputs.build_variant }}
+          path: artifacts/Image
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload kernel modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-modules-ace6t-${{ inputs.build_variant }}
+          path: artifacts/modules.tar.gz
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload build info and logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-info-ace6t-${{ inputs.build_variant }}
+          path: |
+            artifacts/build_info.txt
+            artifacts/*.log
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload full build log (debug only)
+        if: ${{ inputs.debug_mode }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-ace6t-${{ inputs.build_variant }}
+          path: kernel_workspace/build.log
+          retention-days: 7
+          if-no-files-found: warn
+
+      ########################################################################
+      # Step 9: 构建摘要
+      ########################################################################
+      - name: Build summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## OnePlus Ace 6T Kernel Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Device | OnePlus Ace 6T (SM8845) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Kernel | 6.12.38-android16-5 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Variant | ${{ inputs.build_variant }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Date | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY
+          echo "| Run Number | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- vmlinux: ${{ inputs.extract_vmlinux && '✅' || '❌' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- kallsyms: ${{ inputs.extract_kallsyms && '✅' || '❌' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: ✅" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Final Disk Usage" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          df -h / >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
