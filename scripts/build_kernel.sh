@@ -19,7 +19,7 @@ set -euo pipefail
 # ============================================================
 PLATFORM="sun"
 VARIANT=""
-DEBUG="false"
+DEBUG="true"
 WORKSPACE_DIR="$(pwd)"
 
 while [[ $# -gt 0 ]]; do
