@@ -154,12 +154,12 @@ jobs:
       # 使用自定义 Python 脚本, 绕过 manifest 中失效的 CodeLinaro 项目
       ########################################################################
       - name: Sync kernel source
-shell: bash
-env:
-  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-run: |
-  mkdir -p kernel_workspace
-  cd kernel_workspace
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p kernel_workspace
+          cd kernel_workspace
 
   # 1. 修正清单仓库地址 (请确认这是正确的仓库地址)
   MANIFEST_REPO="https://github.com/OnePlusOSS/kernel_manifest.git"
