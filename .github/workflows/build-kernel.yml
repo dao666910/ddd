@@ -161,10 +161,15 @@ jobs:
           mkdir -p kernel_workspace
           cd kernel_workspace
 
+          DEBUG_ARG=""
+          if [ "${{ inputs.debug_mode }}" = "true" ]; then
+            DEBUG_ARG="--debug"
+          fi
+
           python3 ${{ github.workspace }}/scripts/sync_source.py \
             --manifest-url "https://raw.githubusercontent.com/OnePlusOSS/kernel_manifest/oneplus/sm8845/oneplus_ace_6t.xml" \
             --output-dir . \
-            --debug ${{ inputs.debug_mode }}
+            $DEBUG_ARG
 
           echo ""
           echo "=== 同步后磁盘使用 ==="
