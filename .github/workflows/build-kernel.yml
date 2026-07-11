@@ -2,7 +2,7 @@ name: Build OnePlus Ace6T Kernel (vmlinux + kallsyms)
 
 # ============================================================================
 # 一加 Ace6T 内核构建工作流
-# 基于 OnePlusOSS 官方开源内核 (SM8750 / Android 16)
+# 基于 OnePlusOSS 官方开源内核 (SM8845 / Android 16)
 # 输出: vmlinux, kallsyms, Image, boot.img 所需的内核镜像
 # ============================================================================
 
@@ -39,8 +39,8 @@ on:
 
 env:
   MANIFEST_URL: https://github.com/OnePlusOSS/kernel_manifest.git
-  MANIFEST_BRANCH: oneplus/sm8750
-  MANIFEST_NAME: oneplus_ace_6.xml
+  MANIFEST_BRANCH: oneplus/sm8845
+  MANIFEST_NAME: oneplus_ace_6t.xml
   KERNEL_REPO_PATH: kernel_platform/common
   CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
   CCACHE_NOHASHDIR: "true"
@@ -95,9 +95,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /home/runner/.ccache
-          key: ccache-sm8750-ace6t-${{ github.run_id }}
+          key: ccache-sm8845-ace6t-${{ github.run_id }}
           restore-keys: |
-            ccache-sm8750-ace6t-
+            ccache-sm8845-ace6t-
 
       # ----------------------------------------------------------------------
       # 步骤 4: 同步 OnePlus 官方内核源码
@@ -274,10 +274,10 @@ jobs:
             Manifest: ${{ env.MANIFEST_URL }}
             Branch:   ${{ env.MANIFEST_BRANCH }}
             XML:      ${{ env.MANIFEST_NAME }}
-            Revision: oneplus/sm8750_b_16.0.0_ace_6
+            Revision: oneplus/sm8845_b_16.0.0_ace_6t
 
           Device Target:
-            SoC: Qualcomm SM8750 (Snapdragon 8 Elite Gen 5)
+            SoC: Qualcomm SM8845 (Snapdragon 8 Elite Gen 5)
             Device: OnePlus Ace 6 / Ace 6T
             Android: 16
             Kernel: 6.12.x
